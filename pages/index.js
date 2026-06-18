@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import Papa from "papaparse";
 import Head from "next/head";
 
@@ -138,6 +138,11 @@ export default function Home() {
     return await gerarToken();
   };
 
+  // Gera token automaticamente ao carregar se já tiver credenciais salvas
+  useEffect(() => {
+    if (username && password) gerarToken();
+  }, []);
+
   const handleFile = file => {
     if (!file) return;
     Papa.parse(file,{ header:true, skipEmptyLines:true, delimiter:"", complete:res=>{
@@ -233,7 +238,7 @@ export default function Home() {
   return (
     <>
       <Head>
-        <title>Rodonaves Rastreio - DIS COMÉRCIO</title>
+        <title>Rodonaves Rastreio Bot</title>
         <meta name="viewport" content="width=device-width,initial-scale=1" />
         <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
       </Head>
@@ -242,7 +247,7 @@ export default function Home() {
         <div style={{ background:"linear-gradient(135deg,#0d1b2a,#12213b,#0a1628)", borderBottom:"1px solid #1e3a5f", padding:"24px 32px", display:"flex", alignItems:"center", gap:16 }}>
           <div style={{ width:44,height:44,borderRadius:10,background:"linear-gradient(135deg,#f5a623,#e8541a)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,boxShadow:"0 0 20px rgba(245,166,35,0.35)" }}>🚛</div>
           <div>
-            <div style={{ fontSize:20,fontWeight:700,letterSpacing:"0.05em",color:"#fff" }}>RODONAVES <span style={{color:"#f5a623"}}>RASTREIO</span> DIS COMÉRCIO</div>
+            <div style={{ fontSize:20,fontWeight:700,letterSpacing:"0.05em",color:"#fff" }}>RODONAVES <span style={{color:"#f5a623"}}>RASTREIO</span> BOT</div>
             <div style={{ fontSize:11,color:"#6b8cad",letterSpacing:"0.12em" }}>IMPORTAÇÃO EM LOTE VIA CSV</div>
           </div>
         </div>
