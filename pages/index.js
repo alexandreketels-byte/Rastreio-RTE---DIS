@@ -12,14 +12,17 @@ function feriadosDoAno(ano) {
   const lista = FERIADOS_FIXOS.map(f => `${ano}-${f}`);
   const p = calcPascoa(ano);
   const add = (d,n) => { const r=new Date(d); r.setDate(r.getDate()+n); return r; };
-  const fmt = d => d.toISOString().slice(0,10);
+  // Usa ano/mês/dia local para evitar conversão UTC→BRT que troca a data
+  const fmt = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   lista.push(fmt(add(p,-48)),fmt(add(p,-47)),fmt(add(p,-2)),fmt(p),fmt(add(p,60)));
   return lista;
 }
 function isUtil(date) {
   const dow = date.getDay();
   if (dow===0||dow===6) return false;
-  return !feriadosDoAno(date.getFullYear()).includes(date.toISOString().slice(0,10));
+  // Usa data local (não UTC) para comparar com a lista de feriados
+  const key = `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
+  return !feriadosDoAno(date.getFullYear()).includes(key);
 }
 function addDiasUteis(dataInicio, dias) {
   if (!dataInicio||!dias||dias==="—") return null;
@@ -41,7 +44,12 @@ function parseResponse(data) {
   const delivered = isEntregue(description);
   const eventoEntrega = events.slice().reverse().find(ev=>isEntregue(ev.Description));
   const dataEntregaReal = eventoEntrega?.Date ? new Date(eventoEntrega.Date).toLocaleString("pt-BR") : null;
-  const emissionRaw = item.EmissionDate ? new Date(item.EmissionDate) : null;
+  // Extrai apenas YYYY-MM-DD para evitar conversão UTC→BRT (-3h) que adiantava 1 dia na previsão
+  let emissionRaw = null;
+  if (item.EmissionDate) {
+    const p = item.EmissionDate.split('T')[0].split('-');
+    emissionRaw = new Date(parseInt(p[0]), parseInt(p[1]) - 1, parseInt(p[2]));
+  }
   const expectedDays = item.ExpectedDeliveryDays;
   const previsaoDate = addDiasUteis(emissionRaw, expectedDays);
   const previsaoFormatada = previsaoDate ? previsaoDate.toLocaleDateString("pt-BR") : "—";
@@ -111,10 +119,6 @@ export default function Home() {
   const [results, setResults] = useState([]);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [concurrency, setConcurrency] = useState(()=>{
-    const s=ls("rodo_concurrency"); const n=s?parseInt(s,10):6;
-    return Number.isFinite(n)&&n>0?n:6;
-  });
   const [dragOver, setDragOver] = useState(false);
   const [expanded, setExpanded] = useState(null);
   const [inputMode, setInputMode] = useState("cnpj");
@@ -134,11 +138,11 @@ export default function Home() {
       const novo = data.access_token||data.token||data.accessToken;
       const exp = Date.now()+(data.expires_in?data.expires_in*1000:3600000);
       setToken(novo); setTokenExpiry(exp); setTokenStatus("ok");
-      return { token: novo, expiry: exp };
+      return novo;
     } catch { setTokenStatus("error"); return null; }
   };
   const getTokenValido = async () => {
-    if (token&&tokenExpiry&&Date.now()<tokenExpiry-60000) return { token, expiry: tokenExpiry };
+    if (token&&tokenExpiry&&Date.now()<tokenExpiry-60000) return token;
     return await gerarToken();
   };
 
@@ -185,60 +189,36 @@ export default function Home() {
     setRows(mapped); setResults([]); setProgress(0);
   };
 
+  const fetchTrackingAmbos = async (nf, tkn) => {
+    const [r0, r1] = await Promise.all(cnpjs.map(c => fetchTracking(c, nf, tkn)));
+    if (r0.ok && r0.data && r0.data.length > 0) return { ...r0, usedCnpj: cnpjs[0] };
+    if (r1.ok && r1.data && r1.data.length > 0) return { ...r1, usedCnpj: cnpjs[1] };
+    if (r0.ok) return { ...r0, usedCnpj: cnpjs[0] };
+    if (r1.ok) return { ...r1, usedCnpj: cnpjs[1] };
+    return { ...r0, usedCnpj: cnpjs[0] };
+  };
+
   const runRobot = useCallback(async()=>{
     if(!rows.length) return;
-    setRunning(true); abortRef.current=false; setResults([]); setProgress(0);
-    const initial=await getTokenValido();
-    if(!initial){alert("Não foi possível gerar o token. Verifique usuário e senha.");setRunning(false);return;}
-
-    // Estado do token mantido fora do React state, para os workers lerem/atualizarem
-    // em tempo real sem depender de re-render (que é assíncrono e ficaria desatualizado).
-    const tokenState={ token:initial.token, expiry:initial.expiry, refreshing:null };
-    const ensureTokenValido=async()=>{
-      if(tokenState.token&&tokenState.expiry&&Date.now()<tokenState.expiry-60000) return tokenState.token;
-      if(!tokenState.refreshing){
-        tokenState.refreshing=gerarToken().then(r=>{
-          if(r){ tokenState.token=r.token; tokenState.expiry=r.expiry; }
-          tokenState.refreshing=null;
-          return r?r.token:null;
-        });
-      }
-      return await tokenState.refreshing;
-    };
-
-    const out=new Array(rows.length);
-    let completed=0;
-    let nextIndex=0;
-    let lastRender=0;
-    const renderResults=(force)=>{
-      const now=Date.now();
-      if(!force&&now-lastRender<150) return; // evita render excessivo com muitos itens
-      lastRender=now;
-      setResults(out.filter(Boolean));
-    };
-
-    const worker=async()=>{
-      while(true){
-        if(abortRef.current) return;
-        const i=nextIndex++;
-        if(i>=rows.length) return;
-        const row=rows[i];
-        const tkn=await ensureTokenValido();
-        if(!tkn) return;
-        const result=await fetchTracking(row.cnpj,row.nf,tkn);
-        const parsed=result.ok?parseResponse(result.data):null;
-        out[i]={...row,ok:result.ok,lastEvent:result.ok?parsed.lastEvent:result.error,lastDate:result.ok?parsed.lastDate:"—",delivered:result.ok?parsed.delivered:false,atrasado:result.ok?parsed.atrasado:false,previsaoEntrega:result.ok?parsed.previsaoEntrega:"—",dataEntregaReal:result.ok?parsed.dataEntregaReal:null,parsed,rawData:result.data,httpStatus:result.status};
-        completed++;
-        setProgress(Math.round((completed/rows.length)*100));
-        renderResults(false);
-      }
-    };
-
-    const nWorkers=Math.max(1,Math.min(concurrency,rows.length));
-    await Promise.all(Array.from({length:nWorkers},worker));
-    renderResults(true);
+    setRunning(true); abortRef.current=false; setResults([]);
+    let tkn=await getTokenValido();
+    if(!tkn){alert("Não foi possível gerar o token. Verifique usuário e senha.");setRunning(false);return;}
+    const out=[];
+    for(let i=0;i<rows.length;i++){
+      if(abortRef.current) break;
+      const row=rows[i];
+      setProgress(Math.round(((i+1)/rows.length)*100));
+      if(i>0&&i%50===0){const novo=await gerarToken();if(novo)tkn=novo;}
+      const isAmbos = row.cnpj === "AMBOS";
+      const result = isAmbos ? await fetchTrackingAmbos(row.nf, tkn) : await fetchTracking(row.cnpj, row.nf, tkn);
+      const effectiveCnpj = isAmbos ? (result.usedCnpj || cnpjs[0]) : row.cnpj;
+      const parsed=result.ok?parseResponse(result.data):null;
+      out.push({...row,cnpj:effectiveCnpj,ok:result.ok,lastEvent:result.ok?parsed.lastEvent:result.error,lastDate:result.ok?parsed.lastDate:"—",delivered:result.ok?parsed.delivered:false,atrasado:result.ok?parsed.atrasado:false,previsaoEntrega:result.ok?parsed.previsaoEntrega:"—",dataEntregaReal:result.ok?parsed.dataEntregaReal:null,parsed,rawData:result.data,httpStatus:result.status});
+      setResults([...out]);
+      await new Promise(r=>setTimeout(r,400));
+    }
     setRunning(false);
-  },[rows,username,password,token,tokenExpiry,concurrency]);
+  },[rows,username,password,token,tokenExpiry]);
 
   const exportCSV = () => {
     const header=["CNPJ","NF","NF + 1","Último Status","Últ. Atualização","Previsão Entrega","Data Entrega Real","Remetente","Destinatário","Prazo (dias úteis)","Emissão","Entregue","Atrasado"];
@@ -366,6 +346,7 @@ export default function Home() {
                   <div style={{ fontSize:11,color:"#6b8cad",marginBottom:6 }}>CNPJ</div>
                   <select value={selectedCnpj} onChange={e=>setSelectedCnpj(e.target.value)} style={{...s.input,cursor:"pointer"}}>
                     <option value="">— Selecione o CNPJ —</option>
+                    <option value="AMBOS">🔀 Ambos os CNPJs</option>
                     {cnpjs.map((c,i)=><option key={i} value={c}>{fmtCNPJ(c)}</option>)}
                   </select>
                 </div>
@@ -432,18 +413,12 @@ export default function Home() {
           )}
 
           {/* Controles */}
-          <div style={{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+          <div style={{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap"}}>
             <button onClick={runRobot} disabled={running||rows.length===0} style={running||rows.length===0?s.btnDisabled:s.btnPrimary}>
               {running?`⏳ PROCESSANDO... ${progress}%`:"▶ INICIAR RASTREIO"}
             </button>
             {running&&<button onClick={()=>{abortRef.current=true;}} style={s.btnOutline("#e74c3c")}>⏹ PARAR</button>}
             {results.length>0&&!running&&<button onClick={exportCSV} style={s.btnOutline("#00c48c")}>⬇ EXPORTAR CSV</button>}
-            <div style={{display:"flex",alignItems:"center",gap:8,marginLeft:"auto"}}>
-              <div style={{fontSize:11,color:"#6b8cad",whiteSpace:"nowrap"}}>SIMULTÂNEAS</div>
-              <input type="number" min={1} max={20} value={concurrency} disabled={running}
-                onChange={e=>{const n=Math.max(1,Math.min(20,parseInt(e.target.value,10)||1));setConcurrency(n);lsSet("rodo_concurrency",String(n));}}
-                style={{...s.input,width:60,padding:"6px 8px",textAlign:"center"}} />
-            </div>
           </div>
 
           {running&&(
